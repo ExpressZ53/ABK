@@ -23,6 +23,8 @@ import com.abk.kernel.data.model.*
 import com.abk.kernel.data.repository.GitHubRepository
 import com.abk.kernel.data.repository.PreferencesRepository
 import com.abk.kernel.data.repository.Result
+import com.abk.kernel.ui.blur.BlurConfig
+import com.abk.kernel.utils.BackgroundImageStorage
 import com.abk.kernel.utils.BuildMonitorService
 import com.abk.kernel.utils.BuildProgressUtils
 import com.abk.kernel.utils.buildDisplaySnapshot
@@ -124,6 +126,7 @@ data class MainUiState(
     val behindBy: Int = 0,
     val showSyncPrompt: Boolean = false,
     val showOobe: Boolean = false,
+    val showPreferencesResetNotice: Boolean = false,
     val oobeCompleted: Boolean = false,
     val isLoading: Boolean = false,
     val error: String? = null,
@@ -204,12 +207,17 @@ data class MainUiState(
     val customBackgroundUri: String? = null,
     val backgroundImageEnabled: Boolean = false,
     val uiSurfaceAlpha: Float = 1f,
+    val blurEnabled: Boolean = true,
+    val blurBackgroundExpEnabled: Boolean = false,
     val downloadDirectory: String = DownloadDirectoryUtils.defaultDirectoryPath(),
     val downloadMirrorBaseUrl: String = "",
+    val downloadThreadCount: Int = PreferencesRepository.DEFAULT_DOWNLOAD_THREAD_COUNT,
     val prebuiltGkiEnabled: Boolean = true,
     val artifactSigningVerificationEnabled: Boolean = true,
     val artifactSigningConfigured: Boolean = false,
     val artifactSigningOperationInFlight: Boolean = false,
+    val customSourceSecretConfigured: Boolean = false,
+    val customSourceSecretOperationInFlight: Boolean = false,
     val appUpdateStability: String = APP_UPDATE_STABILITY_STABLE,
     val appUpdateLine: String = APP_UPDATE_LINE_NORMAL,
     val appUpdateChecking: Boolean = false,
@@ -236,6 +244,10 @@ data class MainUiState(
     val managerSettingsLoading: Boolean = false,
     val managerSettingsError: String? = null,
     val managerSettingActionId: String? = null,
+    val kernelTcpCongestionControl: KernelTcpCongestionControlState? = null,
+    val kernelCapabilitiesLoading: Boolean = false,
+    val kernelCapabilitiesError: String? = null,
+    val kernelCapabilityActionId: String? = null,
     val susfsRuntimeStatus: SusfsRuntimeStatus? = null,
     val susfsConfig: SusfsConfig = defaultSusfsConfig(),
     val susfsLoading: Boolean = false,
@@ -266,6 +278,15 @@ data class MainUiState(
 ) {
     val isDownloading: Boolean
         get() = activeDownloadTasks.isNotEmpty() || downloadProgress.isNotEmpty()
+
+    /** Blur preferences snapshot for [BlurScreenScaffold]. */
+    val blurConfig: BlurConfig
+        get() = BlurConfig(
+            blurEnabled = blurEnabled,
+            backgroundExpEnabled = blurBackgroundExpEnabled,
+            backgroundUri = customBackgroundUri,
+            backgroundImageEnabled = backgroundImageEnabled,
+        )
 }
 
 class MainViewModel @JvmOverloads constructor(
@@ -303,6 +324,7 @@ class MainViewModel @JvmOverloads constructor(
     private var buildQueueJob: Job? = null
     private var recentRunsRefreshJob: Job? = null
     private var recentRunsRefreshGeneration = 0
+    private var recentRunsRefreshIncludesCompletedArtifacts = false
     private val lateFailedArtifactWatchJobs = mutableMapOf<Long, Job>()
     private var foregroundWorkflowRefreshJob: Job? = null
     private var foregroundWorkflowRefreshIntervalSec =
@@ -316,6 +338,10 @@ class MainViewModel @JvmOverloads constructor(
 
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
+
+    private val _uiSurfaceAlphaPreview = MutableStateFlow(1f)
+    val uiSurfaceAlphaPreview: StateFlow<Float> = _uiSurfaceAlphaPreview.asStateFlow()
+    private var uiSurfaceAlphaPreviewDirty = false
 
     private fun text(@StringRes resId: Int, vararg args: Any): String =
         LocaleHelper.str(resId, *args)
@@ -476,9 +502,30 @@ class MainViewModel @JvmOverloads constructor(
             str = { resId, args -> text(resId, *args) },
         )
         observePreferences()
+        migrateBackgroundUriToInternalStorage()
         observeForegroundWorkflowRefresh()
         if (registerStatusBroadcast) {
             registerStatusReceiver()
+        }
+    }
+
+    /**
+     * One-time migration: older installs persisted the picker's `content://` URI. Copy it
+     * into app-private storage so cold starts decode a local file instead of a cold content
+     * provider (slow wallpaper / black flash after the app is killed and reopened). Runs
+     * only while the stored URI is not already a local file.
+     */
+    private fun migrateBackgroundUriToInternalStorage() {
+        viewModelScope.launch {
+            val uriString = prefs.customBackgroundUri.first() ?: return@launch
+            if (!BackgroundImageStorage.needsCopy(uriString)) return@launch
+            val fileUri = withContext(Dispatchers.IO) {
+                BackgroundImageStorage.copyToInternalStorage(getApplication(), Uri.parse(uriString))
+            } ?: return@launch
+            // Only swap if the user has not picked a different background meanwhile.
+            if (prefs.customBackgroundUri.first() == uriString) {
+                prefs.setBackgroundImageUri(fileUri.toString())
+            }
         }
     }
 
@@ -550,6 +597,11 @@ class MainViewModel @JvmOverloads constructor(
             }
         }
         viewModelScope.launch {
+            prefs.preferencesResetNoticePending.collect { pending ->
+                _uiState.update { state -> state.copy(showPreferencesResetNotice = pending) }
+            }
+        }
+        viewModelScope.launch {
             combine(
                 prefs.themeMode,
                 prefs.dynamicColorEnabled,
@@ -579,6 +631,11 @@ class MainViewModel @JvmOverloads constructor(
             }
         }
         viewModelScope.launch {
+            prefs.downloadThreadCount.collect { count ->
+                _uiState.update { it.copy(downloadThreadCount = count) }
+            }
+        }
+        viewModelScope.launch {
             combine(
                 prefs.customBackgroundUri,
                 prefs.backgroundImageEnabled,
@@ -586,13 +643,39 @@ class MainViewModel @JvmOverloads constructor(
             ) { uri, enabled, alpha ->
                 BackgroundPreferences(uri, enabled, alpha)
             }.collect { backgroundPrefs ->
-                _uiState.update {
-                    it.copy(
-                        customBackgroundUri = backgroundPrefs.uri,
-                        backgroundImageEnabled = backgroundPrefs.enabled,
-                        uiSurfaceAlpha = backgroundPrefs.alpha
-                    )
+                if (!uiSurfaceAlphaPreviewDirty) {
+                    // No drag in progress: keep the preview and the persisted value in
+                    // sync (this also restores the preview after an interrupted drag via
+                    // syncUiSurfaceAlphaPreview()).
+                    _uiSurfaceAlphaPreview.value = backgroundPrefs.alpha
+                    _uiState.update {
+                        it.copy(
+                            customBackgroundUri = backgroundPrefs.uri,
+                            backgroundImageEnabled = backgroundPrefs.enabled,
+                            uiSurfaceAlpha = backgroundPrefs.alpha,
+                        )
+                    }
+                } else {
+                    // Drag in progress: a late DataStore emission from an earlier commit
+                    // must not yank the slider thumb back or override the live preview,
+                    // but background URI/enabled still need to keep up.
+                    _uiState.update {
+                        it.copy(
+                            customBackgroundUri = backgroundPrefs.uri,
+                            backgroundImageEnabled = backgroundPrefs.enabled,
+                        )
+                    }
                 }
+            }
+        }
+        viewModelScope.launch {
+            prefs.blurEnabled.collect { enabled ->
+                _uiState.update { it.copy(blurEnabled = enabled) }
+            }
+        }
+        viewModelScope.launch {
+            prefs.blurBackgroundExpEnabled.collect { enabled ->
+                _uiState.update { it.copy(blurBackgroundExpEnabled = enabled) }
             }
         }
         viewModelScope.launch {
@@ -929,6 +1012,8 @@ class MainViewModel @JvmOverloads constructor(
                     customBackgroundUri = it.customBackgroundUri,
                     backgroundImageEnabled = it.backgroundImageEnabled,
                     uiSurfaceAlpha = it.uiSurfaceAlpha,
+                    blurEnabled = it.blurEnabled,
+                    blurBackgroundExpEnabled = it.blurBackgroundExpEnabled,
                     downloadDirectory = it.downloadDirectory,
                     downloadMirrorBaseUrl = it.downloadMirrorBaseUrl,
                     prebuiltGkiEnabled = it.prebuiltGkiEnabled,
@@ -1740,13 +1825,134 @@ class MainViewModel @JvmOverloads constructor(
 
     // ── Build ─────────────────────────────────────────────────────────────
 
-    fun dispatchBuild(config: KernelBuildConfig) {
+    fun dispatchBuild(
+        config: KernelBuildConfig,
+        customSourcePat: String = "",
+        useDeviceFlowToken: Boolean = false,
+    ) {
         val state = _uiState.value
         if (!state.isLoggedIn || state.user == null || state.forkRepo == null) {
             _uiState.update { it.copy(error = text(R.string.vm_build_login_required)) }
             return
         }
-        enqueueBuild(config)
+        val normalized = KernelSupport.normalize(config)
+        KernelSupport.validateCustomSource(normalized)?.let { validationError ->
+            _uiState.update { it.copy(error = validationError) }
+            return
+        }
+        if (normalized.buildTarget != BUILD_TARGET_CUSTOM_SOURCE ||
+            normalized.sourceAccessMode != SOURCE_ACCESS_GITHUB_PRIVATE
+        ) {
+            enqueueBuild(normalized)
+            return
+        }
+
+        viewModelScope.launch {
+            val owner = state.user.login
+            val fork = state.forkRepo
+            _uiState.update { it.copy(customSourceSecretOperationInFlight = true, error = null) }
+            try {
+                val supplied = when {
+                    customSourcePat.isNotBlank() -> customSourcePat.trim()
+                    useDeviceFlowToken -> prefs.accessToken.first().orEmpty()
+                    else -> ""
+                }
+                if (supplied.isNotBlank()) {
+                    when (val result = github.createOrUpdateRepositorySecret(
+                        owner,
+                        fork.name,
+                        FORK_CUSTOM_SOURCE_SECRET_NAME,
+                        supplied,
+                    )) {
+                        is Result.Success -> _uiState.update { it.copy(customSourceSecretConfigured = true) }
+                        is Result.Error -> {
+                            _uiState.update { it.copy(error = result.message) }
+                            return@launch
+                        }
+                        Result.Loading -> return@launch
+                    }
+                } else if (!refreshCustomSourceSecretStatusInternal(owner, fork.name)) {
+                    _uiState.update { it.copy(error = text(R.string.build_source_private_credential_required)) }
+                    return@launch
+                }
+                enqueueBuild(normalized)
+            } finally {
+                _uiState.update { it.copy(customSourceSecretOperationInFlight = false) }
+            }
+        }
+    }
+
+    fun refreshCustomSourceSecretStatus() {
+        val state = _uiState.value
+        val owner = state.user?.login ?: return
+        val repo = state.forkRepo?.name ?: return
+        viewModelScope.launch {
+            _uiState.update { it.copy(customSourceSecretOperationInFlight = true) }
+            try {
+                refreshCustomSourceSecretStatusInternal(owner, repo)
+            } finally {
+                _uiState.update { it.copy(customSourceSecretOperationInFlight = false) }
+            }
+        }
+    }
+
+    private suspend fun refreshCustomSourceSecretStatusInternal(owner: String, repo: String): Boolean {
+        return when (val result = github.listRepositorySecrets(owner, repo)) {
+            is Result.Success -> result.data.any { it.name == FORK_CUSTOM_SOURCE_SECRET_NAME }.also { configured ->
+                _uiState.update { it.copy(customSourceSecretConfigured = configured) }
+            }
+            is Result.Error -> {
+                _uiState.update { it.copy(error = result.message) }
+                false
+            }
+            Result.Loading -> false
+        }
+    }
+
+    fun deleteCustomSourceSecret() {
+        val state = _uiState.value
+        val owner = state.user?.login ?: return
+        val repo = state.forkRepo?.name ?: return
+        viewModelScope.launch {
+            _uiState.update { it.copy(customSourceSecretOperationInFlight = true, error = null) }
+            try {
+                when (val result = github.deleteRepositorySecret(owner, repo, FORK_CUSTOM_SOURCE_SECRET_NAME)) {
+                    is Result.Success -> _uiState.update { it.copy(customSourceSecretConfigured = false) }
+                    is Result.Error -> _uiState.update { it.copy(error = result.message) }
+                    Result.Loading -> Unit
+                }
+            } finally {
+                _uiState.update { it.copy(customSourceSecretOperationInFlight = false) }
+            }
+        }
+    }
+
+    fun updateCustomSourceSecret(secretValue: String = "", useDeviceFlowToken: Boolean = false) {
+        val state = _uiState.value
+        val owner = state.user?.login ?: return
+        val repo = state.forkRepo?.name ?: return
+        viewModelScope.launch {
+            _uiState.update { it.copy(customSourceSecretOperationInFlight = true, error = null) }
+            try {
+                val value = if (useDeviceFlowToken) prefs.accessToken.first().orEmpty() else secretValue.trim()
+                if (value.isBlank()) {
+                    _uiState.update { it.copy(error = text(R.string.build_source_private_credential_required)) }
+                    return@launch
+                }
+                when (val result = github.createOrUpdateRepositorySecret(
+                    owner,
+                    repo,
+                    FORK_CUSTOM_SOURCE_SECRET_NAME,
+                    value,
+                )) {
+                    is Result.Success -> _uiState.update { it.copy(customSourceSecretConfigured = true) }
+                    is Result.Error -> _uiState.update { it.copy(error = result.message) }
+                    Result.Loading -> Unit
+                }
+            } finally {
+                _uiState.update { it.copy(customSourceSecretOperationInFlight = false) }
+            }
+        }
     }
 
     private fun enqueueBuild(config: KernelBuildConfig) {
@@ -1924,17 +2130,25 @@ class MainViewModel @JvmOverloads constructor(
 
     fun loadRecentRuns(
         showRefreshIndicator: Boolean = true,
-        lightweight: Boolean = false
+        lightweight: Boolean = false,
+        includeCompletedArtifacts: Boolean = false,
     ) {
         val state = _uiState.value
         val username = state.user?.login ?: return
         val repoName = state.forkRepo?.name ?: return
         val userInitiatedFull = showRefreshIndicator && !lightweight
+        val shouldIncludeCompleted = shouldIncludeCompletedArtifacts(
+            lightweight = lightweight,
+            includeCompletedArtifacts = includeCompletedArtifacts,
+        )
         if (recentRunsRefreshJob?.isActive == true) {
-            if (!userInitiatedFull) return
+            if (!userInitiatedFull &&
+                (!shouldIncludeCompleted || recentRunsRefreshIncludesCompletedArtifacts)
+            ) return
             recentRunsRefreshJob?.cancel()
         }
         val generation = ++recentRunsRefreshGeneration
+        recentRunsRefreshIncludesCompletedArtifacts = shouldIncludeCompleted
         recentRunsRefreshJob = viewModelScope.launch {
             _uiState.update { it.copy(isRefreshingRecentRuns = true) }
             try {
@@ -1966,7 +2180,7 @@ class MainViewModel @JvmOverloads constructor(
                             username,
                             repoName,
                             r.data,
-                            includeCompleted = !lightweight,
+                            includeCompleted = shouldIncludeCompleted,
                             includeCompletedPureManagers = lightweight,
                         )
                     }
@@ -1976,6 +2190,7 @@ class MainViewModel @JvmOverloads constructor(
                 if (generation == recentRunsRefreshGeneration) {
                     _uiState.update { it.copy(isRefreshingRecentRuns = false) }
                     recentRunsRefreshJob = null
+                    recentRunsRefreshIncludesCompletedArtifacts = false
                 }
             }
         }
@@ -1991,6 +2206,10 @@ class MainViewModel @JvmOverloads constructor(
             override fun onStop(owner: LifecycleOwner) {
                 appInForeground = false
                 stopForegroundWorkflowRefresh()
+                // Backgrounding (Home / recents) mid-drag never fires the slider's
+                // onValueChangeFinished, so drop the un-persisted preview and restore the
+                // persisted alpha instead of leaving the whole app on a stale value.
+                syncUiSurfaceAlphaPreview()
             }
         })
         viewModelScope.launch {
@@ -2791,7 +3010,8 @@ class MainViewModel @JvmOverloads constructor(
                 text(R.string.vm_prebuilt_gki_label),
                 sourceAssetId = asset.id,
                 downloadDirectory,
-                bundleWithNotices = true
+                bundleWithNotices = true,
+                downloadThreadCount = _uiState.value.downloadThreadCount
             ) { pct ->
                 NotificationUtils.notifyDownloadProgress(getApplication(), pct, asset.name)
                 _uiState.update { s ->
@@ -2865,6 +3085,7 @@ class MainViewModel @JvmOverloads constructor(
                 downloadUrl,
                 downloadDirectory,
                 bundleWithNotices = true,
+                downloadThreadCount = _uiState.value.downloadThreadCount,
                 resolveSigningPublicKeyPem = {
                     val state = _uiState.value
                     val fork = state.forkRepo
@@ -3243,9 +3464,63 @@ class MainViewModel @JvmOverloads constructor(
     fun setCustomThemeColors(themeColorArgb: Int, accentColorArgb: Int) = viewModelScope.launch {
         prefs.setCustomThemeColors(themeColorArgb, accentColorArgb)
     }
-    fun setBackgroundImageUri(uri: String?) = viewModelScope.launch { prefs.setBackgroundImageUri(uri) }
+    /**
+     * Persists the picked background. `content://` picker URIs are first copied into
+     * app-private storage ([BackgroundImageStorage]) so cold starts decode a local file
+     * instead of a (possibly cold) content provider — otherwise the wallpaper can arrive
+     * late / the screen stays black after the app is killed and reopened. Runs in the
+     * view model scope so an early navigation away from the settings screen cannot cancel
+     * the copy. Falls back to the original URI when the copy fails.
+     */
+    fun setBackgroundImageUri(uri: String?) = viewModelScope.launch {
+        val storedUri = if (uri != null && BackgroundImageStorage.needsCopy(uri)) {
+            withContext(Dispatchers.IO) {
+                BackgroundImageStorage.copyToInternalStorage(getApplication(), Uri.parse(uri))
+            }?.toString() ?: uri
+        } else {
+            uri
+        }
+        prefs.setBackgroundImageUri(storedUri)
+    }
     fun setBackgroundImageEnabled(v: Boolean) = viewModelScope.launch { prefs.setBackgroundImageEnabled(v) }
-    fun setUiSurfaceAlpha(alpha: Float) = viewModelScope.launch { prefs.setUiSurfaceAlpha(alpha) }
+    fun setUiSurfaceAlpha(alpha: Float) {
+        val normalized = alpha.coerceIn(0f, 1f)
+        uiSurfaceAlphaPreviewDirty = false
+        _uiSurfaceAlphaPreview.value = normalized
+        viewModelScope.launch { prefs.setUiSurfaceAlpha(normalized) }
+    }
+
+    /**
+     * In-memory preview while the slider is being dragged. Persisted on drag end via
+     * [setUiSurfaceAlpha]; no DataStore write happens per drag tick.
+     */
+    fun setUiSurfaceAlphaPreview(alpha: Float) {
+        uiSurfaceAlphaPreviewDirty = true
+        _uiSurfaceAlphaPreview.value = alpha.coerceIn(0f, 1f)
+    }
+
+    /**
+     * Resets the drag-preview state so the in-memory alpha re-syncs from the persisted
+     * value. Called when the settings page is disposed or the app is backgrounded: an
+     * interrupted drag never fires Slider.onValueChangeFinished, which would otherwise
+     * leave the preview stuck on an un-persisted value for the rest of the session.
+     */
+    fun syncUiSurfaceAlphaPreview() {
+        uiSurfaceAlphaPreviewDirty = false
+        viewModelScope.launch {
+            val persisted = prefs.uiSurfaceAlpha.first()
+            // Re-check: a new drag may have started while the read was in flight.
+            if (!uiSurfaceAlphaPreviewDirty) {
+                _uiSurfaceAlphaPreview.value = persisted
+            }
+        }
+    }
+    fun setBlurEnabled(v: Boolean) = viewModelScope.launch {
+        prefs.setBlurEnabled(v)
+    }
+    fun setBlurBackgroundExpEnabled(v: Boolean) = viewModelScope.launch {
+        prefs.setBlurBackgroundExpEnabled(v)
+    }
     fun acceptTerms() = viewModelScope.launch { prefs.acceptCurrentTerms() }
     suspend fun loadFlashFilterJson(): String? = prefs.flashFilterJson.first()
     fun saveFlashFilterJson(json: String) = viewModelScope.launch { prefs.saveFlashFilterJson(json) }
@@ -3254,6 +3529,9 @@ class MainViewModel @JvmOverloads constructor(
     }
     fun setDownloadMirrorBaseUrl(url: String) = viewModelScope.launch {
         prefs.setDownloadMirrorBaseUrl(url)
+    }
+    fun setDownloadThreadCount(value: Int) = viewModelScope.launch {
+        prefs.setDownloadThreadCount(value)
     }
     fun setPredictiveBackEnabled(v: Boolean) = viewModelScope.launch { prefs.setPredictiveBackEnabled(v) }
     fun setPrebuiltGkiEnabled(v: Boolean) = viewModelScope.launch {
@@ -3379,7 +3657,8 @@ class MainViewModel @JvmOverloads constructor(
                     getApplication(),
                     token = token,
                     url = downloadUrl,
-                    preferredLine = info.line
+                    preferredLine = info.line,
+                    downloadThreadCount = _uiState.value.downloadThreadCount
                 ) { progress ->
                     _uiState.update { state ->
                         state.copy(appUpdateDownloading = true, appUpdateDownloadProgress = progress)
@@ -3631,6 +3910,77 @@ class MainViewModel @JvmOverloads constructor(
                         managerSettingActionId = null,
                         managerSettingsError = result.output.lastOrNull()?.takeIf { line -> line.isNotBlank() }
                             ?: text(R.string.settings_operation_incomplete)
+                    )
+                }
+            }
+        }
+    }
+
+    fun refreshKernelCapabilities(force: Boolean = false) {
+        if (!force && _uiState.value.kernelCapabilitiesLoading) return
+        viewModelScope.launch {
+            val rootGranted = _uiState.value.rootGranted
+            _uiState.update { it.copy(kernelCapabilitiesLoading = true, kernelCapabilitiesError = null) }
+            val access = withContext(Dispatchers.IO) { resolveManagerAccess(rootGranted) }
+            if (access.kind == RootUtils.ManagerAccessKind.NO_ROOT) {
+                val message = managerAccessErrorMessage(access, rootGranted)
+                _uiState.update {
+                    it.copy(
+                        managerAccessState = access.toUiState(),
+                        managerAccessError = message,
+                        hasNativeManagerPermission = false,
+                        kernelTcpCongestionControl = null,
+                        kernelCapabilitiesLoading = false,
+                        kernelCapabilitiesError = message,
+                        kernelCapabilityActionId = null
+                    )
+                }
+                return@launch
+            }
+            val tcp = withContext(Dispatchers.IO) { RootUtils.readTcpCongestionControl() }
+            _uiState.update {
+                it.copy(
+                    managerAccessState = access.toUiState(),
+                    managerAccessError = null,
+                    hasNativeManagerPermission = access.hasNativeManagerPermission,
+                    kernelTcpCongestionControl = tcp,
+                    kernelCapabilitiesLoading = false,
+                    kernelCapabilitiesError = if (tcp?.available == true) {
+                        null
+                    } else {
+                        text(R.string.settings_kernel_capabilities_unavailable)
+                    },
+                    kernelCapabilityActionId = null
+                )
+            }
+        }
+    }
+
+    fun setTcpCongestionControlAlgorithm(algorithm: String) {
+        val clean = algorithm.trim()
+        if (clean.isBlank() || _uiState.value.kernelCapabilityActionId != null) return
+        viewModelScope.launch {
+            val actionId = "$KERNEL_CAPABILITY_TCP_CONGESTION:$clean"
+            _uiState.update {
+                it.copy(kernelCapabilityActionId = actionId, kernelCapabilitiesError = null)
+            }
+            val rootGranted = _uiState.value.rootGranted
+            val result = withContext(Dispatchers.IO) {
+                val access = resolveManagerAccess(rootGranted)
+                if (access.kind == RootUtils.ManagerAccessKind.NO_ROOT) {
+                    RootUtils.ShellResult(false, listOf(managerAccessErrorMessage(access, rootGranted)))
+                } else {
+                    RootUtils.setTcpCongestionControl(clean)
+                }
+            }
+            if (result.success) {
+                refreshKernelCapabilities(force = true)
+            } else {
+                _uiState.update {
+                    it.copy(
+                        kernelCapabilityActionId = null,
+                        kernelCapabilitiesError = result.output.lastOrNull()?.takeIf { line -> line.isNotBlank() }
+                            ?: text(R.string.settings_tcp_congestion_change_failed)
                     )
                 }
             }
@@ -3938,6 +4288,11 @@ class MainViewModel @JvmOverloads constructor(
         rootGranted: Boolean
     ): ManagerSettingsLoad =
         runCatching {
+            val kernelCapabilitiesItem = if (rootGranted || access.hasNativeManagerPermission) {
+                buildKernelCapabilitiesManagerSetting()
+            } else {
+                null
+            }
             val susfsItem = if (rootGranted) {
                 buildSusfsManagerSetting(RootUtils.readSusfsRuntimeStatus())
             } else {
@@ -3945,13 +4300,15 @@ class MainViewModel @JvmOverloads constructor(
             }
 
             if (!access.hasNativeManagerPermission || !RootUtils.isNativeManagerActive()) {
-                if (susfsItem == null) {
+                val items = listOfNotNull(kernelCapabilitiesItem, susfsItem)
+                if (items.isEmpty()) {
                     ManagerSettingsLoad()
                 } else {
+                    val manager = access.runtime?.normalizedForManagerSettings()
                     ManagerSettingsLoad(
-                        backend = "susfs",
-                        title = text(R.string.settings_manager_settings),
-                        items = listOf(susfsItem)
+                        backend = manager?.backend?.takeIf { it.isNotBlank() } ?: "kernel",
+                        title = manager?.let { managerSettingsTitle(it) } ?: text(R.string.settings_kernel_capabilities),
+                        items = items
                     )
                 }
             } else {
@@ -3983,17 +4340,45 @@ class MainViewModel @JvmOverloads constructor(
                     )
                 }
                 }
-                if (susfsItem == null) {
-                    base
-                } else {
-                    base.copy(items = base.items + susfsItem)
-                }
+                base.copy(
+                    items = mergeManagerNavigationItems(
+                        baseItems = base.items,
+                        kernelCapabilitiesItem = kernelCapabilitiesItem,
+                        susfsItem = susfsItem
+                    )
+                )
             }
         }.getOrElse { error ->
             ManagerSettingsLoad(
                 error = error.message?.takeIf { it.isNotBlank() } ?: text(R.string.settings_manager_load_failed)
             )
         }
+
+    private fun buildKernelCapabilitiesManagerSetting(): ManagerSettingItem? {
+        val tcp = RootUtils.readTcpCongestionControl()
+            ?.takeIf { RootUtils.hasManageableTcpCongestionControl(it) }
+            ?: return null
+        val current = tcp.currentAlgorithm.ifBlank { text(R.string.settings_unknown) }
+        return ManagerSettingItem(
+            id = MANAGER_SETTING_KERNEL_CAPABILITIES,
+            title = text(R.string.settings_kernel_capabilities),
+            subtitle = text(R.string.settings_kernel_capabilities_summary, current, tcp.availableAlgorithms.size),
+            kind = ManagerSettingKind.NAVIGATION
+        )
+    }
+
+    private fun mergeManagerNavigationItems(
+        baseItems: List<ManagerSettingItem>,
+        kernelCapabilitiesItem: ManagerSettingItem?,
+        susfsItem: ManagerSettingItem?
+    ): List<ManagerSettingItem> {
+        val extraItems = listOfNotNull(kernelCapabilitiesItem, susfsItem)
+        if (extraItems.isEmpty()) return baseItems
+        val insertIndex = baseItems.indexOfFirst { it.kind != ManagerSettingKind.NAVIGATION }
+            .takeIf { it >= 0 }
+            ?: baseItems.size
+        return baseItems.take(insertIndex) + extraItems + baseItems.drop(insertIndex)
+    }
 
     private fun buildSusfsManagerSetting(status: SusfsRuntimeStatus): ManagerSettingItem? {
         if (!status.available) return null
@@ -5251,6 +5636,13 @@ class MainViewModel @JvmOverloads constructor(
         it.copy(snackbarMessage = null, snackbarLongDuration = false)
     }
 
+    fun dismissPreferencesResetNotice() {
+        _uiState.update { it.copy(showPreferencesResetNotice = false) }
+        viewModelScope.launch {
+            prefs.clearPreferencesResetNotice()
+        }
+    }
+
     fun clearCustomExternalModuleError() = _uiState.update { it.copy(customExternalModuleError = null) }
 
     private fun buildPlanCodecMessages(): BuildPlanCodecMessages = BuildPlanCodecMessages(
@@ -5288,6 +5680,14 @@ internal fun sanitizeBuildPlanName(name: String, config: KernelBuildConfig): Str
 internal fun defaultBuildPlanName(config: KernelBuildConfig): String {
     if (config.buildTarget == BUILD_TARGET_ONEPLUS) {
         return listOf(KernelSupport.onePlusDeviceLabel(config.onePlusDeviceManifest), config.kernelsuVariant)
+            .filter { it.isNotBlank() }
+            .joinToString(" · ")
+    }
+    if (config.buildTarget == BUILD_TARGET_CUSTOM_SOURCE) {
+        val sourceName = config.sourceDeviceLabel.ifBlank {
+            config.sourceUrl.substringAfterLast('/').removeSuffix(".git")
+        }
+        return listOf(sourceName, config.sourceRef, config.osPatchLevel)
             .filter { it.isNotBlank() }
             .joinToString(" · ")
     }
@@ -5337,6 +5737,7 @@ internal data class BuildPlanCodecMessages(
     val unsupportedVersion: String = "Unsupported plan code version",
     val tooManyModules: String = "External module count exceeds the limit",
     val tooManyKernelOptions: String = "Kernel option count exceeds the limit",
+    val tooManyDefconfigs: String = "Defconfig count exceeds the limit",
     val negativeNumber: String = "Negative numbers can not be written to a plan code",
     val fieldTooLong: String = "Plan field is too long",
     val incomplete: String = "Plan code content is incomplete",
@@ -5364,6 +5765,12 @@ internal fun encodeBuildPlanPayload(
         writer.writeString(config.buildTarget)
         writer.writeString(config.onePlusCpu)
         writer.writeString(config.onePlusDeviceManifest)
+        writer.writeString(config.sourceUrl)
+        writer.writeString(config.sourceRef)
+        writer.writeString(config.sourceAccessMode)
+        writer.writeVarInt(config.sourceDefconfigs.size)
+        config.sourceDefconfigs.forEach(writer::writeString)
+        writer.writeString(config.sourceDeviceLabel)
     }
     writer.writeByte(BUILD_PLAN_KSU_VARIANTS.indexOrZero(config.kernelsuVariant))
     writer.writeByte(BUILD_PLAN_KSU_BRANCHES.indexOrZero(config.kernelsuBranch))
@@ -5458,7 +5865,7 @@ internal fun decodeBuildPlanPayload(
         val osPatchLevel = reader.readString()
         val revision = reader.readString()
         if (version >= BUILD_PLAN_ONEPLUS_FIELDS_VERSION) {
-            baseConfig.copy(
+            val targetBase = baseConfig.copy(
                 androidVersion = androidVersion,
                 kernelVersion = kernelVersion,
                 subLevel = subLevel,
@@ -5468,6 +5875,23 @@ internal fun decodeBuildPlanPayload(
                 onePlusCpu = reader.readString(),
                 onePlusDeviceManifest = reader.readString()
             )
+            if (version >= BUILD_PLAN_CUSTOM_SOURCE_FIELDS_VERSION) {
+                val sourceUrl = reader.readString()
+                val sourceRef = reader.readString()
+                val sourceAccessMode = reader.readString()
+                val defconfigCount = reader.readVarInt()
+                require(defconfigCount in 0..BUILD_PLAN_MAX_DEFCONFIGS) { messages.tooManyDefconfigs }
+                val sourceDefconfigs = List(defconfigCount) { reader.readString() }
+                targetBase.copy(
+                    sourceUrl = sourceUrl,
+                    sourceRef = sourceRef,
+                    sourceAccessMode = sourceAccessMode,
+                    sourceDefconfigs = sourceDefconfigs,
+                    sourceDeviceLabel = reader.readString()
+                )
+            } else {
+                targetBase
+            }
         } else {
             baseConfig.copy(
                 androidVersion = androidVersion,
@@ -5839,17 +6263,19 @@ private const val LATE_FAILED_ARTIFACT_POLL_INTERVAL_MS = 5_000L
 
 private const val BUILD_PLAN_CODE_PREFIX = "ABKP2:"
 private const val BUILD_PLAN_LEGACY_CODE_PREFIX = "ABKP1:"
-private const val BUILD_PLAN_CODE_VERSION = 7
+private const val BUILD_PLAN_CODE_VERSION = 8
 private const val BUILD_PLAN_MIN_SUPPORTED_VERSION = 2
 private const val BUILD_PLAN_CUSTOM_REF_VERSION = 3
 private const val BUILD_PLAN_ONEPLUS_FIELDS_VERSION = 4
 private const val BUILD_PLAN_KSU_BRANCH_V5_VERSION = 5
 private const val BUILD_PLAN_MODULE_METADATA_VERSION = 6
 private const val BUILD_PLAN_KERNEL_OPTIONS_VERSION = 7
+private const val BUILD_PLAN_CUSTOM_SOURCE_FIELDS_VERSION = 8
 private const val BUILD_PLAN_NAME_LIMIT = 80
 private const val BUILD_PLAN_MAX_STRING_BYTES = 4096
 private const val BUILD_PLAN_MAX_MODULES = 32
 private const val BUILD_PLAN_MAX_KERNEL_OPTIONS = 256
+private const val BUILD_PLAN_MAX_DEFCONFIGS = 128
 private const val OFFICIAL_BUILD_MODULE_CATALOG_ID = "official-abk-module-catalog"
 private const val OFFICIAL_BUILD_MODULE_CATALOG_URL = "https://github.com/xingguangcuican6666/ABK_repo"
 
@@ -6149,6 +6575,35 @@ private fun WorkflowRun.toBuildStatus(): BuildStatus = when (status) {
 // Helper to convert KernelBuildConfig to workflow dispatch inputs map
 internal fun KernelBuildConfig.toInputMap(): Map<String, String> {
     val config = KernelSupport.normalize(this)
+    if (config.buildTarget == BUILD_TARGET_CUSTOM_SOURCE) {
+        return mapOf(
+            "source_repo" to config.sourceUrl,
+            "source_ref" to config.sourceRef,
+            "source_private" to (config.sourceAccessMode == SOURCE_ACCESS_GITHUB_PRIVATE).toString(),
+            "defconfigs" to config.sourceDefconfigs.joinToString("\n"),
+            "device_label" to config.sourceDeviceLabel,
+            "os_patch_level" to config.osPatchLevel,
+            "kernelsu_variant" to config.kernelsuVariant,
+            "kernelsu_branch" to config.kernelsuBranch,
+            "custom_ref" to if (config.kernelsuBranch == KSU_BRANCH_CUSTOM) config.customRef else "",
+            "version" to config.version,
+            "build_time" to config.buildTime,
+            "virtualization_support" to config.virtualizationSupport,
+            "use_zram" to config.useZram.toString(),
+            "use_bbg" to config.useBbg.toString(),
+            "use_ddk" to config.useDdk.toString(),
+            "use_ntsync" to config.useNtsync.toString(),
+            "use_networking" to config.useNetworking.toString(),
+            "use_kpm" to config.useKpm.toString(),
+            "use_rekernel" to config.useRekernel.toString(),
+            "cancel_susfs" to config.cancelSusfs.toString(),
+            "zram_full_algo" to config.zramFullAlgo.toString(),
+            "zram_extra_algos" to config.zramExtraAlgos,
+            "kpm_password" to config.kpmPassword,
+            "custom_external_modules" to if (config.useCustomExternalModules) config.customExternalModules.toWorkflowInput() else "",
+            "custom_kernel_options" to config.customKernelOptions.mapNotNull { it.toWorkflowLine() }.joinToString("\n"),
+        )
+    }
     if (config.buildTarget == BUILD_TARGET_ONEPLUS) {
         return mapOf(
             "cpu" to config.onePlusCpu,
@@ -6228,11 +6683,13 @@ private fun List<CustomExternalModule>?.toWorkflowInput(): String = this.orEmpty
     .joinToString("|")
 
 private const val KERNEL_WORKFLOW_FILE = "kernel-custom.yml"
+private const val CUSTOM_SOURCE_WORKFLOW_FILE = "kernel-source.yml"
 private const val FORK_ARTIFACT_SIGNING_SECRET_NAME = "ABK_ARTIFACT_SIGNING_KEY_BASE64"
+private const val FORK_CUSTOM_SOURCE_SECRET_NAME = "ABK_CUSTOM_SOURCE_GITHUB_TOKEN"
 private const val FORK_ARTIFACT_SIGNING_RELEASE_TAG = "abk-artifact-key"
 private const val FORK_ARTIFACT_SIGNING_PUBLIC_KEY_ASSET_NAME = "abk-artifact-signing-public.pem"
 private const val ONEPLUS_WORKFLOW_FILE = "oneplus-custom.yml"
-private val buildWorkflowFiles = listOf(KERNEL_WORKFLOW_FILE, ONEPLUS_WORKFLOW_FILE)
+private val buildWorkflowFiles = listOf(KERNEL_WORKFLOW_FILE, CUSTOM_SOURCE_WORKFLOW_FILE, ONEPLUS_WORKFLOW_FILE)
 private const val MIRROR_WORKFLOW_FILE = "mirror-custom-artifacts.yml"
 private val ACTIVE_BUILD_STATUSES = setOf(BuildStatus.QUEUED, BuildStatus.IN_PROGRESS)
 private const val MANAGER_SETTING_APP_PROFILE_TEMPLATES = "app_profile_templates"
@@ -6246,6 +6703,8 @@ private const val MANAGER_SETTING_SELINUX_HIDE = "selinux_hide"
 private const val MANAGER_SETTING_DEFAULT_UMOUNT = "default_umount_modules"
 private const val MANAGER_SETTING_WEBVIEW_DEBUG = "webview_debug"
 private const val MANAGER_SETTING_SUSFS = "susfs_control"
+private const val MANAGER_SETTING_KERNEL_CAPABILITIES = "kernel_capabilities"
+private const val KERNEL_CAPABILITY_TCP_CONGESTION = "tcp_congestion"
 private const val MANAGER_TOOL_SELINUX_MODE = "selinux_mode"
 private const val MANAGER_TOOL_BACKUP_ALLOWLIST = "backup_allowlist"
 private const val MANAGER_TOOL_RESTORE_ALLOWLIST = "restore_allowlist"
@@ -6260,10 +6719,10 @@ private data class ManagerSettingsLoad(
 private data class Quadruple<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
 
 private fun workflowFileFor(config: KernelBuildConfig): String =
-    if (KernelSupport.normalizeBuildTarget(config.buildTarget) == BUILD_TARGET_ONEPLUS) {
-        ONEPLUS_WORKFLOW_FILE
-    } else {
-        KERNEL_WORKFLOW_FILE
+    when (KernelSupport.normalizeBuildTarget(config.buildTarget)) {
+        BUILD_TARGET_ONEPLUS -> ONEPLUS_WORKFLOW_FILE
+        BUILD_TARGET_CUSTOM_SOURCE -> CUSTOM_SOURCE_WORKFLOW_FILE
+        else -> KERNEL_WORKFLOW_FILE
     }
 
 /**
