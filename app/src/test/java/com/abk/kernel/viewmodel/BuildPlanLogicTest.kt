@@ -11,7 +11,7 @@ import com.abk.kernel.data.model.BUILD_TARGET_ONEPLUS
 import com.abk.kernel.data.model.KSU_BRANCH_CUSTOM
 import com.abk.kernel.data.model.KSU_BRANCH_STABLE
 import com.abk.kernel.data.model.KSU_VARIANT_NONE
-import com.abk.kernel.data.model.KSU_VARIANT_RESUKISU
+import com.abk.kernel.data.model.KSU_VARIANT_BAKASU
 import com.abk.kernel.data.model.KSU_VARIANT_SUKISU
 import com.abk.kernel.data.model.SOURCE_ACCESS_GITHUB_PRIVATE
 import com.abk.kernel.data.model.KernelBuildConfig
@@ -169,6 +169,12 @@ class BuildPlanLogicTest {
         assertEquals("gki_defconfig\nvendor/peridot_GKI.config", inputs["defconfigs"])
         assertEquals("None", inputs["kernelsu_variant"])
         assertEquals(false, inputs.keys.any { it.contains("token", ignoreCase = true) || it.contains("credential", ignoreCase = true) })
+        // os_patch_level 与 kernel_version_override 合并进 version_overrides（JSON），规避 dispatch 25 输入上限
+        assertEquals(false, inputs.containsKey("os_patch_level"))
+        assertEquals(false, inputs.containsKey("kernel_version_override"))
+        val overrides = com.google.gson.Gson().fromJson(inputs["version_overrides"], Map::class.java)
+        assertEquals("2025-09", overrides["os_patch_level"])
+        assertEquals("", overrides["kernel_version_override"])
     }
 
     @Test
@@ -323,7 +329,7 @@ class BuildPlanLogicTest {
         val baseConfig = KernelSupport.normalize(
             KernelBuildConfig(
                 buildTarget = BUILD_TARGET_GKI,
-                kernelsuVariant = KSU_VARIANT_RESUKISU
+                kernelsuVariant = KSU_VARIANT_BAKASU
             )
         )
         val sharedFeatures = KernelSupport.normalize(

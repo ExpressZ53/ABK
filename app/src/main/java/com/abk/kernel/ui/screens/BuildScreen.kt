@@ -36,6 +36,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
@@ -74,7 +75,7 @@ import com.abk.kernel.data.model.KSU_BRANCH_CUSTOM
 import com.abk.kernel.data.model.KSU_BRANCH_LATEST
 import com.abk.kernel.data.model.KSU_BRANCH_STABLE
 import com.abk.kernel.data.model.KSU_VARIANT_NONE
-import com.abk.kernel.data.model.KSU_VARIANT_RESUKISU
+import com.abk.kernel.data.model.KSU_VARIANT_BAKASU
 import com.abk.kernel.data.model.KSU_VARIANT_SUKISU
 import com.abk.kernel.data.model.ModuleCatalogItem
 import com.abk.kernel.data.model.ModuleCatalogItemKind
@@ -1380,7 +1381,7 @@ fun BuildScreen(
                     } else {
                         config.copy(
                             buildTarget = BUILD_TARGET_GKI,
-                            kernelsuVariant = KSU_VARIANT_RESUKISU
+                            kernelsuVariant = KSU_VARIANT_BAKASU
                         )
                     }
                     vm.updateBuildConfig(KernelSupport.normalize(next))
@@ -1448,12 +1449,22 @@ fun BuildScreen(
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
+                    var sourceRefFocused by remember { mutableStateOf(false) }
                     OutlinedTextField(
                         value = config.sourceRef,
                         onValueChange = { vm.updateBuildConfig(config.copy(sourceRef = it)) },
                         label = { Text(stringResource(R.string.build_source_ref)) },
                         placeholder = { Text("lineage-23.2 或 40 位 commit SHA") },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onFocusChanged { focusState ->
+                                val wasFocused = sourceRefFocused
+                                sourceRefFocused = focusState.isFocused
+                                // 失焦时自动从源码 Makefile 检测内核版本
+                                if (wasFocused && !focusState.isFocused) {
+                                    vm.detectCustomSourceVersion()
+                                }
+                            },
                         singleLine = true
                     )
                     val publicSourceLabel = stringResource(R.string.build_source_public)
@@ -1472,10 +1483,43 @@ fun BuildScreen(
                         onSelect = { vm.updateBuildConfig(config.copy(sourceAccessMode = it)) }
                     )
                     OutlinedTextField(
+                        value = config.sourceKernelVersionOverride,
+                        onValueChange = {
+                            vm.updateBuildConfig(config.copy(sourceKernelVersionOverride = it))
+                        },
+                        label = { Text(stringResource(R.string.build_source_kernel_version)) },
+                        placeholder = { Text("5.10.177") },
+                        supportingText = {
+                            when {
+                                state.customSourceDetecting ->
+                                    Text(stringResource(R.string.build_source_detecting))
+                                state.customSourceDetectError != null ->
+                                    Text(
+                                        state.customSourceDetectError!!,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                else ->
+                                    Text(stringResource(R.string.build_source_kernel_version_hint))
+                            }
+                        },
+                        trailingIcon = if (state.customSourceDetecting) {
+                            {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    strokeWidth = 2.dp
+                                )
+                            }
+                        } else {
+                            null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
                         value = config.osPatchLevel,
                         onValueChange = { vm.updateBuildConfig(config.copy(osPatchLevel = it)) },
                         label = { Text(stringResource(R.string.build_source_patch_month)) },
-                        placeholder = { Text("2025-09") },
+                        placeholder = { Text(stringResource(R.string.build_source_patch_month_placeholder)) },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
@@ -1632,6 +1676,7 @@ fun BuildScreen(
 
             SectionCard(section = BuildSection.KernelSu) {
                 val noRootScheme = config.kernelsuVariant == KSU_VARIANT_NONE
+                val deprecatedVariantAlias = KernelSupport.isDeprecatedKsuVariantAlias(rawConfig.kernelsuVariant)
                 DropdownField(
                     label = stringResource(R.string.build_kernelsu_variant),
                     value = config.kernelsuVariant,
@@ -1640,6 +1685,13 @@ fun BuildScreen(
                         vm.updateBuildConfig(KernelSupport.normalize(config.copy(kernelsuVariant = it)))
                     }
                 )
+                if (deprecatedVariantAlias) {
+                    Text(
+                        text = stringResource(R.string.build_ksu_variant_deprecated),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
                 if (noRootScheme) {
                     Text(
                         text = if (isOnePlusBuild) {

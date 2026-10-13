@@ -8,6 +8,25 @@ import org.junit.Test
 class KernelSupportTest {
 
     @Test
+    fun normalizeKsuVariantFoldsRetiredResukisuAliasesIntoBakasu() {
+        listOf("ReSukiSU", "resukisu", "Re-SukiSU", " re-suki ").forEach { legacy ->
+            assertEquals(
+                "legacy alias <$legacy> should normalize to BakaSU",
+                KSU_VARIANT_BAKASU,
+                KernelSupport.normalizeKsuVariant(legacy, BUILD_TARGET_GKI),
+            )
+            assertEquals(
+                "legacy alias <$legacy> should normalize to BakaSU on OnePlus",
+                KSU_VARIANT_BAKASU,
+                KernelSupport.normalizeKsuVariant(legacy, BUILD_TARGET_ONEPLUS),
+            )
+        }
+        // The retired spelling must not be mistaken for the current BakaSU option itself.
+        assertFalse(KernelSupport.isDeprecatedKsuVariantAlias(KSU_VARIANT_BAKASU))
+        assertTrue(KernelSupport.isDeprecatedKsuVariantAlias("ReSukiSU"))
+    }
+
+    @Test
     fun customSourceValidationAcceptsOrderedDuplicatesAndRejectsUnsafePaths() {
         val valid = KernelBuildConfig(
             buildTarget = BUILD_TARGET_CUSTOM_SOURCE,
@@ -180,10 +199,10 @@ class KernelSupportTest {
     }
 
     @Test
-    fun normalizeDisablesKpmForResukisuDevAndLatest() {
+    fun normalizeDisablesKpmForBakasuDevAndLatest() {
         val dev = KernelSupport.normalize(
             KernelBuildConfig(
-                kernelsuVariant = KSU_VARIANT_RESUKISU,
+                kernelsuVariant = KSU_VARIANT_BAKASU,
                 kernelsuBranch = KSU_BRANCH_DEV,
                 useKpm = true,
                 kpmPassword = "secret"
@@ -191,7 +210,7 @@ class KernelSupportTest {
         )
         val latest = KernelSupport.normalize(
             KernelBuildConfig(
-                kernelsuVariant = KSU_VARIANT_RESUKISU,
+                kernelsuVariant = KSU_VARIANT_BAKASU,
                 kernelsuBranch = KSU_BRANCH_LATEST,
                 useKpm = true,
                 kpmPassword = "secret"
@@ -205,10 +224,10 @@ class KernelSupportTest {
     }
 
     @Test
-    fun normalizeKeepsKpmForResukisuStableAndCustom() {
+    fun normalizeKeepsKpmForBakasuStableAndCustom() {
         val stable = KernelSupport.normalize(
             KernelBuildConfig(
-                kernelsuVariant = KSU_VARIANT_RESUKISU,
+                kernelsuVariant = KSU_VARIANT_BAKASU,
                 kernelsuBranch = KSU_BRANCH_STABLE,
                 useKpm = true,
                 kpmPassword = "secret"
@@ -216,7 +235,7 @@ class KernelSupportTest {
         )
         val custom = KernelSupport.normalize(
             KernelBuildConfig(
-                kernelsuVariant = KSU_VARIANT_RESUKISU,
+                kernelsuVariant = KSU_VARIANT_BAKASU,
                 kernelsuBranch = KSU_BRANCH_CUSTOM,
                 useKpm = true,
                 kpmPassword = "secret"
@@ -252,5 +271,48 @@ class KernelSupportTest {
         assertEquals("", stable.kpmPassword)
         assertFalse(custom.useKpm)
         assertEquals("", custom.kpmPassword)
+    }
+
+    @Test
+    fun customSourceValidationAcceptsBlankAndWellFormedKernelOverride() {
+        val base = KernelBuildConfig(
+            buildTarget = BUILD_TARGET_CUSTOM_SOURCE,
+            sourceUrl = "https://github.com/LineageOS/android_kernel_google_gs201.git",
+            sourceRef = "lineage-21",
+            sourceDefconfigs = listOf("gki_defconfig"),
+            osPatchLevel = "2025-09",
+            kernelsuVariant = KSU_VARIANT_NONE,
+        )
+        // 空 override 合法（走服务端自动检测）
+        assertEquals(null, KernelSupport.validateCustomSource(base))
+        // X.Y 与 X.Y.Z 合法
+        assertEquals(null, KernelSupport.validateCustomSource(base.copy(sourceKernelVersionOverride = "5.10")))
+        assertEquals(null, KernelSupport.validateCustomSource(base.copy(sourceKernelVersionOverride = "6.13.42")))
+        // 非法格式被拒
+        assertTrue(KernelSupport.validateCustomSource(base.copy(sourceKernelVersionOverride = "abc")) != null)
+        assertTrue(KernelSupport.validateCustomSource(base.copy(sourceKernelVersionOverride = "5")) != null)
+        assertTrue(KernelSupport.validateCustomSource(base.copy(sourceKernelVersionOverride = "5.10.1.2")) != null)
+    }
+
+    @Test
+    fun normalizeClearsKernelOverrideForNonCustomSourceTargets() {
+        val gki = KernelSupport.normalize(
+            KernelBuildConfig(
+                buildTarget = BUILD_TARGET_GKI,
+                sourceKernelVersionOverride = "5.10.177",
+            )
+        )
+        assertEquals("", gki.sourceKernelVersionOverride)
+
+        val custom = KernelSupport.normalize(
+            KernelBuildConfig(
+                buildTarget = BUILD_TARGET_CUSTOM_SOURCE,
+                sourceUrl = "https://github.com/example/kernel.git",
+                sourceRef = "lineage-21",
+                sourceKernelVersionOverride = "  6.6.50  ",
+                kernelsuVariant = KSU_VARIANT_NONE,
+            )
+        )
+        assertEquals("6.6.50", custom.sourceKernelVersionOverride)
     }
 }
