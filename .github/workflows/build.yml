@@ -2321,6 +2321,34 @@ jobs:
               echo "已修复 memory.c 缺少 susfs_def.h 问题"
             }
 
+            fix_task_mmu_missing_susfs_def() {
+              local file="./fs/proc/task_mmu.c"
+              [ -f "$file" ] || return 0
+              # 仅当 SUSFS 主体 hunk 已应用（使用了宏）但头部 hunk 被 reject 时注入
+              grep -q 'SUSFS_IS_INODE_SUS_MAP\|SUSFS_IS_INODE_OPEN_REDIRECT' "$file" || return 0
+              grep -qF 'susfs_def.h' "$file" && return 0
+              if grep -qF '#include <linux/pkeys.h>' "$file"; then
+                sed -i '/#include <linux\/pkeys.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif' "$file"
+              elif grep -qF '#include <linux/shmem_fs.h>' "$file"; then
+                sed -i '/#include <linux\/shmem_fs.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif' "$file"
+              else
+                sed -i '1i #ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif' "$file"
+              fi
+              echo "已修复 task_mmu.c 缺少 susfs_def.h 问题"
+            }
+
+            fix_a13_515_namespace_missing_susfs_def() {
+              local file="./fs/namespace.c"
+              [ -f "$file" ] || return 0
+              grep -q 'DEFAULT_KSU_MNT_ID\|susfs_is_current_ksu_domain\|CL_COPY_MNT_NS' "$file" || return 0
+              grep -qF 'susfs_def.h' "$file" && return 0
+              sed -i '/#include <linux\/mnt_idmapping.h>/a #ifdef CONFIG_KSU_SUSFS\n#include <linux\/susfs_def.h>\n#endif' "$file"
+              if ! grep -q 'extern bool susfs_is_current_ksu_domain' "$file"; then
+                sed -i '/#include "internal.h"/a \\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS BIT(25)\n#endif\n#endif' "$file"
+              fi
+              echo "已修复 android13-5.15 namespace.c 缺少 susfs_def.h 问题"
+            }
+
             fix_selinux_extern_static() {
               local file="./security/selinux/hooks.c"
               if [ -f "$file" ] && grep -qF 'extern static int security_context_to_sid_with_policy' "$file"; then
@@ -2613,6 +2641,13 @@ jobs:
                   fix_task_mmu_show_pad
                 fi
               fi
+              # 2026-10: susfs4ksu gki-android13-5.15 分支 rebase 到 5.15.211 后，
+              # task_mmu.c / namespace.c 的头部 hunk（注入 susfs_def.h include 与
+              # extern 声明）在 <5.15.211 的所有子版本上被 reject，而主体 hunk 仍会
+              # 应用，导致 SUSFS_IS_INODE_* / DEFAULT_KSU_MNT_ID 等符号未声明。
+              # 这里对所有 5.15 子版本无条件做源码兜底注入（自带幂等守卫）。
+              fix_task_mmu_missing_susfs_def
+              fix_a13_515_namespace_missing_susfs_def
             fi
 
             # Android 14 - 6.1 修复
@@ -5205,6 +5240,26 @@ jobs:
 
               // sucompat: permitted process can execute 'su' to gain root access.
               """)
+
+              # ABK: 新版 susfs4ksu 的 10_enable_susfs_for_ksu.patch 会把
+              # struct user_arg_ptr 与 static inline get_user_arg_ptr 注入
+              # runtime/ksud.h，而 sucompat.c 直接 include 该头文件；此时必须
+              # 去掉注入文本里的同名定义，否则报 redefinition of 'get_user_arg_ptr'。
+              # 旧版补丁树（ksud.h 无此定义）仍保留注入定义。
+              ksud_header = ksu_dir / "runtime/ksud.h"
+              if ksud_header.exists() and "static inline const char __user *get_user_arg_ptr" in ksud_header.read_text():
+                  stripped = re.sub(
+                      r"static const char __user \*get_user_arg_ptr\(struct user_arg_ptr argv, int nr\)\n\{.*?\n\}\n\n",
+                      "",
+                      replacement,
+                      count=1,
+                      flags=re.S,
+                  )
+                  if stripped == replacement:
+                      raise SystemExit(f"{path}: runtime/ksud.h 已定义 get_user_arg_ptr，但未能在注入文本中定位重复定义")
+                  replacement = stripped
+                  print(f"runtime/ksud.h 已提供 get_user_arg_ptr，已移除 {path} 注入文本中的重复定义")
+
               region_pattern = re.compile(
                   r'#define SU_PATH "/system/bin/su"\n#define SH_PATH "/system/bin/sh"\n.*?\n// sucompat: permitted process can execute \'su\' to gain root access\.\n',
                   re.S,
