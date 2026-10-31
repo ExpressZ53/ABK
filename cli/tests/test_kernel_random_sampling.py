@@ -22,8 +22,9 @@ KERNEL_MATRIX_WORKFLOWS = {
     "android14": ("6.1", ROOT / ".github" / "workflows" / "kernel-a14-6-1.yml"),
     "android15": ("6.6", ROOT / ".github" / "workflows" / "kernel-a15-6-6.yml"),
     "android16": ("6.12", ROOT / ".github" / "workflows" / "kernel-a16-6-12.yml"),
+    "android17": ("6.18", ROOT / ".github" / "workflows" / "kernel-a17-6-18.yml"),
 }
-VALID_COMBOS = {"android12", "android13", "android14", "android15", "android16"}
+VALID_COMBOS = {"android12", "android13", "android14", "android15", "android16", "android17"}
 
 
 def load_sampler():
